@@ -1,0 +1,32 @@
+共同点：在并发编程中，通过加锁对共享资源进行互斥访问，从而实现共享资源的同步，保证线程安全
+
+不同点：
+1）支持的行为不同：
+Lock 支持等锁时可中断、非阻塞式获取、支持条件变量，常见的实现类有 ReentrantLock，ReadWriteLock。而synchronized 只支持阻塞式获取锁，且不可中断
+
+
+2） 使用方式不同
+Synchronized
+通过定义在 method  或者方法块上使用。定义在方法块上，JVM会在方法指令前后增加 monitorEnter、monitorExit 指令来决定是否需要加锁；定义在方法上，会在方法增加指令 ACC_SYNCHONIZED识别；方法执行结束或者出现异常，都会自动释放锁
+
+Lock
+需要用户手动进行 lock，手动释放
+
+3） 实现机制不同
+synchronized 依赖对象头+ monitor 来实现，每一个对象都有一个 monitor 来管理锁状态monitor 的定义（Java 定义）
+
+class Monitor {
+Thread own;    当前拥有锁的线程
+int lockCount;  锁的重入次数
+List<Thread> lockList;   等待获取锁的线程队列
+List<Thread> waitList;   等待唤醒的线程队列
+}
+
+在锁已经升级到重量级锁的情况下，获取锁先尝试用cas操作将 own 置为 自己，如果成功，则获取锁成功，将计数器++，否则将当前线程加入 lockList，等待锁释放后进行锁竞争。
+
+ReentrantLock 基于 cas + AQS 来实现的，内部维护了一个 state，双向链表，加锁时先使用 cas 操作将 state 置为1，成功则获取锁成功；如果失败，则再尝试一次 cas 获取锁，如果还是失败，则将当前线程加入到队列尾部，挂起线程，下次唤醒后采用自旋锁获取锁
+
+4）	不同并发场景性能不同
+在不同的并发场景下，Synchronized 与 lock 的性能有差别，并发低的场景，使用 synchronized 性能更好，并发高时，Synchronized的性能会变得很慢。在JVM 底层，Java 增加了偏向锁与轻量级锁的机制，每个对象的对象头都有一个 markWord 结构，该结构用来记录当前锁的状态，如果没有出现过锁竞争，则处于偏向锁时，线程能直接获取锁；当出现锁竞争时，则会升级成轻量级锁，获取锁失败的时候，会使用自适应自旋锁的机制来获取锁，只有当自旋最终失败时，才会升级成重量级锁，此时所有的锁竞争失败，都会进入阻塞等待队列，等待锁释放
+在 jdk1.8 上，concurrentHashMap 采用 cas + synchronized 替代 cas + segment，操作时加锁而不是 segment 上，而是细化到链表的 node 上，因为访问同一个 node 的概率会变低，且一般可通过自旋获得，因此在性能上会比段锁更优。
+但是在并发高的场景下，使用 Synchronized 时，锁释放后，会同时唤醒所有等待的线程，但只有一个线程可以获取锁，其他线程唤醒后只能继续挂起，这带来不必要的线程切换开销。而 ReentrantLock 只会唤醒队头线程和刚进来的线程，因此在并发高时，性能能比较稳定。
