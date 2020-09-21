@@ -1,7 +1,7 @@
 <!DOCTYPE html>
   <html>
     <head>
-      <title>618 redis 连接风暴导致 connect timeout</title>
+      <title>讲稿</title>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       
@@ -214,51 +214,36 @@ code.language-yaml {
     </head>
     <body for="html-export">
       <div class="mume markdown-preview   ">
-      <h1 class="mume-header" id="%E9%97%AE%E9%A2%98%E8%83%8C%E6%99%AF">问题背景</h1>
+      <h1 class="mume-header" id="%E7%BB%9F%E8%AE%A1%E5%9F%BA%E7%A1%80%E5%B9%B3%E5%8F%B0">统计基础平台</h1>
 
-<p>抢券活动后台使用了 Redis，抢券开始时，用户抢到券，但实际券未到账。经日志排查发现后端连接 redis 报 connect timeout，而前端认为成功了。</p>
-<h1 class="mume-header" id="%E9%97%AE%E9%A2%98%E5%88%86%E6%9E%90%E4%B8%8E%E6%8E%92%E6%9F%A5">问题分析与排查</h1>
+<h2 class="mume-header" id="%E7%BB%9F%E4%B8%80%E6%9D%83%E9%99%90%E6%A8%A1%E5%9D%97">统一权限模块</h2>
 
-<p><strong>定位客户端问题还是服务端问题</strong><br>
-从错误日志分布来看，所有机器都短暂的出现大量的 connect timeout 异常，则初步认为与客户端无关，是服务器的问题。通过查看 redis 服务器的监控，redis 机器 cpu 不高，但 cps 每秒基本都处于 1000+左右（cps 表示每秒创建的连接数），每秒创建1000多条连接，因此假定问题是由于连接风暴导致的</p>
-<p><strong>定位为什么会产生连接风暴</strong><br>
-查看客户端应用的连接池配置，发现 jedis 连接池中两个参数</p>
+<p><strong>调研：</strong><br>
+目标应用：基础平台中的所有 web 应用<br>
+权限使用的场景：基于角色、基于 API<br>
+模型：<br>
+<img src="./image/%E6%9D%83%E9%99%90%E6%A8%A1%E5%9D%97.png" alt="Alt text"></p>
+<p><strong>方案选型</strong></p>
 <ul>
-<li>connectTimeout：1000，连接超时时间</li>
-<li>maxIdle: 10  最大空闲连接数</li>
-<li>maxTotal: 20 最大连接数</li>
+<li>基于 spring security：支持原生注解 hasRole、hasPermission，支持编程式鉴权</li>
+<li>基于 shiro：支持原生注解 requiresRole、requiresPermissions，支持编程式鉴权</li>
 </ul>
-<p>Jedis 客户端的连接管理机制：</p>
-<ul>
-<li>获取连接时，如果当前无可用连接且连接数少于 maxTotal，则创建新连接</li>
-<li>归还连接时，如果当前 idle 连接&lt; maxIdle，则将连接放进池中；如果 &gt;= maxIdle直接销毁连接，则直接将连接销毁</li>
-</ul>
-<p>因此这就解释了在抢券高并发场景中，大于 10 的连接基本都是短链接，用完直接 close 掉，所以导致了连接风暴的产生。<br>
-因此只需要将 maxIdle 和 maxTotal 配置成一致，则可以解决连接风暴的问题。</p>
-<p><strong>连接风暴为什么会导致 connect timeout</strong><br>
-由于无法在线上定位，因此通过线下模拟，并用 jmeter 进行压测，发现当 cps 为200左右的时候，也会偶尔出现 connect timeout 异常。通过 tcpdump 和 wireshark 抓包分析发现出现丢包的情况，这个问题与 TCP 机制层面有关</p>
-<p>以客户端和服务端(redis)通信过程来说明这个问题</p>
-<p>请求 A 到来</p>
-<ol>
-<li>首先客户端与服务端建立了通信，假设客户端占用的端口号为 33333</li>
-<li>请求结束，客户端主动 close 连接</li>
-<li>服务端回了 fin/ack 后，并没有收到客户端的 ACK 报文，导致服务端一直处于 last_ack 状态，此时服务端认为连接还未关闭</li>
-</ol>
-<p>请求 B 到来</p>
-<ol>
-<li>由于打开了 tcp_reuse，客户端不需要等待 time_wait 状态，直接复用了端口 33333 的连接，向服务端发送 syn 报文</li>
-<li>服务端收到 SYN 报文，但是由于服务端认为连接还未关闭，所以丢弃了 SYN 报文，重传了 FIN/ACK</li>
-<li>客户端收到 FIN/ACK 报文，因为该报文属于旧连接的，因此回了一个 RST 报文，继续等待之前发送 SYN 报文的确认</li>
-<li>服务端收到 RST 报文，主动关闭了连接</li>
-<li>客户端 1s 后还未收到 SYN/ACK 报文，则触发重传，但此时 connect timeout 为 1s，则同时也触发 connect timeout 异常</li>
-</ol>
-<p>主要原因是由于：打开了 tcp_reuse，触发了端口复用，同时由于旧连接出现丢包情况，未正常关闭导致超时</p>
-<p><strong>time_wait 的作用是什么</strong><br>
-在四次挥手中，客户端回了最后的 ACK 报文后，会处于 time_wait 状态，该状态持续 2msl 时间（msl = 报文最大的存活时间），主要作用是</p>
-<ol>
-<li>保证旧连接中仍在网络传输中的报文都被过期掉，避免新连接收到旧报文；</li>
-<li>重传最后的 ACK 报文，避免服务端没收到最后的 ACK 报文而导致连接未关闭</li>
-</ol>
+<p>方案对比：<br>
+shiro 相对于 Spring security 使用起来更简单更方便，不需要配置繁琐的配置；但大多数目标应用都是基于 spring security 开发，为了让业务应用可以无缝接入，所以最终采用基于 Spring Security</p>
+<p>最终权限模块的结构图为：</p>
+<h2 class="mume-header" id="%E7%BB%84%E4%BB%B6%E7%AE%A1%E7%90%86%E4%B8%8A%E6%8A%A5">组件管理上报</h2>
+
+<p><strong>背景：</strong><br>
+应用规范化上云改造、组件版本升级管理</p>
+<p>待解决的问题：<br>
+- 兼容收集多种类型的客户端信息：分析不同类型的应用结构，定制化规则<br>
+- 支持动态增加收集规则</p>
+<p>实现结构：<br>
+<img src="./image/%E7%BB%84%E4%BB%B6%E6%89%AB%E6%8F%8F%E7%BB%93%E6%9E%84.png" alt="Alt text"></p>
+<p>服务提供方：<br>
+<img src="./image/%E7%BB%84%E4%BB%B6%E6%9C%8D%E5%8A%A1%E6%8F%90%E4%BE%9B%E6%96%B9.png" alt="Alt text"></p>
+<p>服务使用方：<br>
+<img src="./image/%E6%9C%8D%E5%8A%A1%E4%BD%BF%E7%94%A8%E6%96%B9.png" alt="Alt text"></p>
 
       </div>
       
